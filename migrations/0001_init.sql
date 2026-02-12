@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS payments (
+    payment_id UUID PRIMARY KEY,
+    merchant_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    amount_minor BIGINT NOT NULL,
+    currency TEXT NOT NULL,
+    payment_method TEXT NOT NULL,
+    issuing_bank TEXT NULL,
+    gateway_used TEXT NOT NULL,
+    routing_strategy TEXT NOT NULL,
+    routing_reason TEXT NOT NULL,
+    status TEXT NOT NULL,
+    gateway_transaction_ref TEXT NULL,
+    gateway_response_code TEXT NULL,
+    error_message TEXT NULL,
+    latency_ms INT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (merchant_id, idempotency_key)
+);
