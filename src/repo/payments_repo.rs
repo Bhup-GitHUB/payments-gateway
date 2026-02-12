@@ -1,5 +1,5 @@
 use crate::domain::payment::{CreatePaymentRequest, PaymentStatus};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 pub struct PaymentRecordInput {
@@ -66,7 +66,10 @@ impl PaymentsRepo {
         }))
     }
 
-    pub async fn insert_payment(&self, data: PaymentRecordInput) -> anyhow::Result<()> {
+    pub async fn insert_payment_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        data: &PaymentRecordInput,
+    ) -> anyhow::Result<()> {
         sqlx::query(
             r#"
             INSERT INTO payments (
@@ -85,18 +88,18 @@ impl PaymentsRepo {
         .bind(data.idempotency_key)
         .bind(data.request_hash)
         .bind(data.req.amount_minor)
-        .bind(data.req.currency)
+        .bind(data.req.currency.clone())
         .bind(format!("{:?}", data.req.payment_method))
-        .bind(data.issuing_bank)
-        .bind(data.gateway_used)
-        .bind(data.routing_strategy)
-        .bind(data.routing_reason)
+        .bind(data.issuing_bank.clone())
+        .bind(data.gateway_used.clone())
+        .bind(data.routing_strategy.clone())
+        .bind(data.routing_reason.clone())
         .bind(format!("{:?}", data.status).to_uppercase())
-        .bind(data.gateway_transaction_ref)
-        .bind(data.gateway_response_code)
-        .bind(data.error_message)
+        .bind(data.gateway_transaction_ref.clone())
+        .bind(data.gateway_response_code.clone())
+        .bind(data.error_message.clone())
         .bind(data.latency_ms)
-        .execute(&self.pool)
+        .execute(tx.as_mut())
         .await?;
 
         Ok(())

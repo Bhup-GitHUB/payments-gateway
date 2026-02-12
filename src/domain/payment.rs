@@ -45,7 +45,7 @@ pub struct CreatePaymentRequest {
     pub instrument: PaymentInstrument,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PaymentStatus {
     Success,

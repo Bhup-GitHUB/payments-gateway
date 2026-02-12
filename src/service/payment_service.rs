@@ -3,10 +3,14 @@ use crate::domain::payment::{CreatePaymentRequest, CreatePaymentResponse, ErrorE
 use crate::gateways::mock::MockGateway;
 use crate::gateways::razorpay::RazorpayGateway;
 use crate::gateways::{GatewayRequest, PaymentGateway};
+use crate::metrics::amount_bucket::from_amount_minor;
+use crate::metrics::event::PaymentEvent;
 use crate::repo::gateways_repo::GatewaysRepo;
+use crate::repo::outbox_repo::OutboxRepo;
 use crate::repo::payments_repo::{PaymentRecordInput, PaymentsRepo};
 use crate::router::round_robin::RoundRobinRouter;
 use axum::http::HeaderMap;
+use sqlx::PgPool;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -15,7 +19,9 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct PaymentService {
+    pub pool: PgPool,
     pub payments_repo: PaymentsRepo,
+    pub outbox_repo: OutboxRepo,
     pub gateways_repo: GatewaysRepo,
     pub router: Arc<RoundRobinRouter>,
     pub razorpay: Arc<RazorpayGateway>,
@@ -127,25 +133,52 @@ impl PaymentService {
         let latency_ms = start.elapsed().as_millis() as i32;
         let payment_id = Uuid::new_v4();
 
-        self.payments_repo
-            .insert_payment(PaymentRecordInput {
-                payment_id,
-                merchant_id: req.merchant_id.clone(),
-                idempotency_key,
-                request_hash,
-                req,
-                issuing_bank: context.issuing_bank,
-                gateway_used: gateway_result.gateway_used.clone(),
-                routing_strategy: "ROUND_ROBIN".to_string(),
-                routing_reason: routing_reason.clone(),
-                status: gateway_result.response.status.clone(),
-                gateway_transaction_ref: gateway_result.response.transaction_id.clone(),
-                gateway_response_code: gateway_result.response.gateway_response_code.clone(),
-                error_message: gateway_result.response.error_message.clone(),
-                latency_ms,
-            })
+        let payment_input = PaymentRecordInput {
+            payment_id,
+            merchant_id: req.merchant_id.clone(),
+            idempotency_key,
+            request_hash,
+            req: req.clone(),
+            issuing_bank: context.issuing_bank.clone(),
+            gateway_used: gateway_result.gateway_used.clone(),
+            routing_strategy: "ROUND_ROBIN".to_string(),
+            routing_reason: routing_reason.clone(),
+            status: gateway_result.response.status.clone(),
+            gateway_transaction_ref: gateway_result.response.transaction_id.clone(),
+            gateway_response_code: gateway_result.response.gateway_response_code.clone(),
+            error_message: gateway_result.response.error_message.clone(),
+            latency_ms,
+        };
+
+        let event = PaymentEvent {
+            payment_id,
+            gateway_used: gateway_result.gateway_used.clone(),
+            payment_method: method.clone(),
+            issuing_bank: context
+                .issuing_bank
+                .clone()
+                .unwrap_or_else(|| "UNKNOWN".to_string())
+                .to_uppercase(),
+            amount_bucket: from_amount_minor(req.amount_minor),
+            status: gateway_result.response.status.clone(),
+            latency_ms,
+            error_code: gateway_result.response.error_code.clone(),
+            timestamp: chrono::Utc::now(),
+        };
+
+        let mut tx = self.pool.begin().await.map_err(|e| internal(e.into()))?;
+        PaymentsRepo::insert_payment_tx(&mut tx, &payment_input)
             .await
             .map_err(internal)?;
+        OutboxRepo::insert_tx(
+            &mut tx,
+            payment_id,
+            "payment.attempted",
+            serde_json::to_value(event).map_err(|e| internal(e.into()))?,
+        )
+        .await
+        .map_err(internal)?;
+        tx.commit().await.map_err(|e| internal(e.into()))?;
 
         Ok(CreatePaymentResponse {
             payment_id,

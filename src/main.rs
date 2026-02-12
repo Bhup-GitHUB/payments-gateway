@@ -1,40 +1,18 @@
-mod domain {
-    pub mod context;
-    pub mod payment;
-}
-mod gateways;
-mod http {
-    pub mod handlers {
-        pub mod gateways;
-        pub mod payments;
-    }
-}
-mod repo {
-    pub mod gateways_repo;
-    pub mod payments_repo;
-}
-mod router {
-    pub mod round_robin;
-}
-mod service {
-    pub mod payment_service;
-}
-
 use axum::routing::{get, patch, post};
 use axum::Router;
-use gateways::razorpay::RazorpayGateway;
-use repo::gateways_repo::GatewaysRepo;
-use repo::payments_repo::PaymentsRepo;
-use service::payment_service::PaymentService;
+use payments_gateway::config::AppConfig;
+use payments_gateway::gateways::razorpay::RazorpayGateway;
+use payments_gateway::metrics::store_redis::MetricsHotStore;
+use payments_gateway::repo::gateways_repo::GatewaysRepo;
+use payments_gateway::repo::outbox_repo::OutboxRepo;
+use payments_gateway::repo::payments_repo::PaymentsRepo;
+use payments_gateway::router::round_robin::RoundRobinRouter;
+use payments_gateway::service::outbox_relay::OutboxRelay;
+use payments_gateway::service::payment_service::PaymentService;
+use payments_gateway::AppState;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
-
-#[derive(Clone)]
-pub struct AppState {
-    payment_service: PaymentService,
-    gateways_repo: GatewaysRepo,
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -42,19 +20,23 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/payments_gateway".to_string());
+    let cfg = AppConfig::from_env();
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
-        .connect(&database_url)
+        .connect(&cfg.database_url)
         .await?;
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
+    let redis_client = redis::Client::open(cfg.redis_url.clone())?;
+    let metrics_hot_store = MetricsHotStore::new(&cfg.redis_url)?;
+
     let gateways_repo = GatewaysRepo { pool: pool.clone() };
     let payments_repo = PaymentsRepo { pool: pool.clone() };
-    let router = Arc::new(router::round_robin::RoundRobinRouter::new());
+    let outbox_repo = OutboxRepo { pool: pool.clone() };
+
+    let router = Arc::new(RoundRobinRouter::new());
     let razorpay = Arc::new(RazorpayGateway {
         base_url: std::env::var("RAZORPAY_BASE_URL")
             .unwrap_or_else(|_| "https://api.razorpay.com".to_string()),
@@ -68,30 +50,43 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let payment_service = PaymentService {
+        pool: pool.clone(),
         payments_repo,
+        outbox_repo: outbox_repo.clone(),
         gateways_repo: gateways_repo.clone(),
         router,
         razorpay,
     };
 
+    let relay = OutboxRelay {
+        outbox_repo,
+        redis_client,
+        stream_key: cfg.stream_key.clone(),
+    };
+    tokio::spawn(relay.run());
+
     let state = AppState {
         payment_service,
         gateways_repo,
+        metrics_hot_store,
     };
 
     let app = Router::new()
-        .route("/health", get(http::handlers::payments::health))
-        .route("/payments", post(http::handlers::payments::create_payment))
-        .route("/gateways", get(http::handlers::gateways::list_gateways))
+        .route("/health", get(payments_gateway::http::handlers::payments::health))
+        .route("/payments", post(payments_gateway::http::handlers::payments::create_payment))
+        .route("/gateways", get(payments_gateway::http::handlers::gateways::list_gateways))
         .route(
             "/gateways/:gateway_id",
-            patch(http::handlers::gateways::update_gateway),
+            patch(payments_gateway::http::handlers::gateways::update_gateway),
+        )
+        .route(
+            "/metrics/gateways/:gateway_name",
+            get(payments_gateway::http::handlers::metrics::get_gateway_metrics),
         )
         .with_state(state);
 
-    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("listening on {}", addr);
+    let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
+    tracing::info!("listening on {}", cfg.bind_addr);
     axum::serve(listener, app).await?;
     Ok(())
 }
