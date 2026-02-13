@@ -1,33 +1,49 @@
 # payments-gateway
 
-Rust + Axum payment API implementing Phase 1 to Phase 5 foundations.
+Rust + Axum payment API implementing Phase 1 to Phase 7 foundations with scoring, circuit breaker, fallback retries, experiments, and optimization controls.
 
 ## APIs
 - `POST /payments`
 - `GET /payments/:payment_id/routing-decision`
+- `GET /payments/:payment_id/attempts`
+- `GET /payments/:payment_id/status-verification`
 - `GET /gateways`
 - `PATCH /gateways/:gateway_id`
 - `GET /metrics/gateways/:gateway_name`
 - `GET /scoring/debug`
 - `GET /circuit-breaker/status`
-- `POST /circuit-breaker/force-open/:gateway/:method`
-- `POST /circuit-breaker/force-close/:gateway/:method`
+- `POST /circuit-breaker/force-open/:gateway/:method` (admin key)
+- `POST /circuit-breaker/force-close/:gateway/:method` (admin key)
+- `GET /retry-policy/:merchant_id`
+- `PUT /retry-policy/:merchant_id` (admin key)
+- `POST /experiments` (admin key)
+- `GET /experiments`
+- `GET /experiments/:id/results`
+- `GET /experiments/:id/winner`
+- `POST /experiments/:id/stop` (admin key)
+- `POST /bandit/policy/:segment/enable` (admin key)
+- `GET /bandit/state`
+- `GET /ops/readiness`
+- `GET /ops/liveness`
 
-## Routing flow
+## Routing and reliability flow
 - Build payment context.
 - Load enabled gateways for payment method.
-- Read live metrics from Redis.
-- Score each gateway with weighted scoring engine.
-- Filter candidates through circuit breaker state.
-- Execute selected gateway.
-- Persist payment, outbox event, and routing decision.
+- Apply experiment override (deterministic by `customer_id`) when active.
+- Score gateways with weighted scoring engine.
+- Optionally reorder with feature-flagged Thompson sampling by segment.
+- Apply circuit-breaker checks.
+- Execute fallback retry chain under merchant policy and latency budget.
+- On timeout, return `PENDING_VERIFICATION` and enqueue verification job.
+- Persist payment, outbox event, payment attempts, and routing decision.
 
-## Metrics and event pipeline
-- `POST /payments` writes payment + outbox in one DB transaction.
-- API relay publishes outbox events to Redis Stream.
-- `metrics_worker` consumes events and writes:
+## Metrics and events
+- Outbox relay publishes payment events to Redis Streams.
+- `metrics_worker` consumes stream and updates:
   - hot metrics in Redis
   - historical snapshots in Postgres `gateway_metrics`
+- `experiment_analyzer` computes significance recommendations.
+- `payment_verifier` processes pending verification queue.
 
 ## Required env
 - `DATABASE_URL` (default: `postgres://postgres:postgres@localhost:5432/payments_gateway`)
@@ -40,15 +56,18 @@ Rust + Axum payment API implementing Phase 1 to Phase 5 foundations.
 - `METRICS_STREAM_KEY` (default: `payments:events:v1`)
 - `METRICS_STREAM_GROUP` (default: `metrics-agg-v1`)
 - `METRICS_CONSUMER_NAME` (worker only, default: `metrics-worker-1`)
+- `INTERNAL_API_KEY` (default: `dev-internal-key`)
 
 ## Run API
 ```bash
 cargo run
 ```
 
-## Run worker
+## Run workers
 ```bash
 cargo run --bin metrics_worker
+cargo run --bin payment_verifier
+cargo run --bin experiment_analyzer
 ```
 
 ## Example payment request
@@ -61,6 +80,7 @@ curl -X POST http://localhost:3000/payments \
     "currency": "INR",
     "payment_method": "UPI",
     "merchant_id": "m_001",
+    "customer_id": "cust_001",
     "instrument": {
       "type": "UPI",
       "vpa": "test@okhdfcbank"
@@ -68,17 +88,16 @@ curl -X POST http://localhost:3000/payments \
   }'
 ```
 
-## Example routing decision request
+## Example admin request
 ```bash
-curl "http://localhost:3000/payments/<payment_id>/routing-decision"
-```
-
-## Example scoring debug request
-```bash
-curl "http://localhost:3000/scoring/debug?amount_minor=250000&payment_method=UPI&issuing_bank=HDFC"
-```
-
-## Example circuit status request
-```bash
-curl "http://localhost:3000/circuit-breaker/status"
+curl -X PUT http://localhost:3000/retry-policy/m_001 \
+  -H 'Content-Type: application/json' \
+  -H 'X-Internal-Api-Key: dev-internal-key' \
+  -d '{
+    "merchant_id": "m_001",
+    "max_attempts": 3,
+    "latency_budget_ms": 10000,
+    "retry_on_timeout": false,
+    "enabled": true
+  }'
 ```
