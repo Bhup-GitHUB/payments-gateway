@@ -7,6 +7,7 @@ use payments_gateway::gateways::razorpay::RazorpayGateway;
 use payments_gateway::metrics::store_redis::MetricsHotStore;
 use payments_gateway::repo::circuit_breaker_config_repo::CircuitBreakerConfigRepo;
 use payments_gateway::repo::error_classification_repo::ErrorClassificationRepo;
+use payments_gateway::repo::experiments_repo::ExperimentsRepo;
 use payments_gateway::repo::gateways_repo::GatewaysRepo;
 use payments_gateway::repo::outbox_repo::OutboxRepo;
 use payments_gateway::repo::payment_attempts_repo::PaymentAttemptsRepo;
@@ -50,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
     let retry_policy_repo = RetryPolicyRepo { pool: pool.clone() };
     let error_classification_repo = ErrorClassificationRepo { pool: pool.clone() };
     let payment_verification_repo = PaymentVerificationRepo { pool: pool.clone() };
+    let experiments_repo = ExperimentsRepo { pool: pool.clone() };
     let razorpay = Arc::new(RazorpayGateway {
         base_url: std::env::var("RAZORPAY_BASE_URL")
             .unwrap_or_else(|_| "https://api.razorpay.com".to_string()),
@@ -90,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         payment_service,
         gateways_repo,
         metrics_hot_store,
+        experiments_repo: experiments_repo.clone(),
         routing_decisions_repo,
         circuit_breaker_config_repo,
         payment_attempts_repo,
@@ -111,6 +114,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/circuit-breaker/force-close/:gateway/:method",
             post(payments_gateway::http::handlers::circuit_breaker::force_close),
+        )
+        .route(
+            "/experiments",
+            post(payments_gateway::http::handlers::experiments::create_experiment),
+        )
+        .route(
+            "/experiments/:id/stop",
+            post(payments_gateway::http::handlers::experiments::stop_experiment),
         )
         .layer(from_fn_with_state(
             admin_key,
@@ -152,6 +163,11 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/retry-policy/:merchant_id",
             get(payments_gateway::http::handlers::retry_policy::get_retry_policy),
+        )
+        .route("/experiments", get(payments_gateway::http::handlers::experiments::list_experiments))
+        .route(
+            "/experiments/:id/results",
+            get(payments_gateway::http::handlers::experiments::get_results),
         )
         .merge(admin_routes)
         .with_state(state);

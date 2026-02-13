@@ -12,6 +12,7 @@ pub mod http {
     }
     pub mod handlers {
         pub mod circuit_breaker;
+        pub mod experiments;
         pub mod gateways;
         pub mod metrics;
         pub mod payment_attempts;
@@ -52,6 +53,7 @@ pub struct AppState {
     pub payment_service: service::payment_service::PaymentService,
     pub gateways_repo: repo::gateways_repo::GatewaysRepo,
     pub metrics_hot_store: metrics::store_redis::MetricsHotStore,
+    pub experiments_repo: repo::experiments_repo::ExperimentsRepo,
     pub routing_decisions_repo: repo::routing_decisions_repo::RoutingDecisionsRepo,
     pub circuit_breaker_config_repo: repo::circuit_breaker_config_repo::CircuitBreakerConfigRepo,
     pub payment_attempts_repo: repo::payment_attempts_repo::PaymentAttemptsRepo,
