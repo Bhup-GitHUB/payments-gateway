@@ -5,6 +5,7 @@ pub struct AppConfig {
     pub redis_url: String,
     pub stream_key: String,
     pub stream_group: String,
+    pub internal_api_key: String,
 }
 
 impl AppConfig {
@@ -19,6 +20,8 @@ impl AppConfig {
                 .unwrap_or_else(|_| "payments:events:v1".to_string()),
             stream_group: std::env::var("METRICS_STREAM_GROUP")
                 .unwrap_or_else(|_| "metrics-agg-v1".to_string()),
+            internal_api_key: std::env::var("INTERNAL_API_KEY")
+                .unwrap_or_else(|_| "dev-internal-key".to_string()),
         }
     }
 }

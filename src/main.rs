@@ -1,4 +1,5 @@
-use axum::routing::{get, patch, post};
+use axum::middleware::from_fn_with_state;
+use axum::routing::{get, patch, post, put};
 use axum::Router;
 use payments_gateway::config::AppConfig;
 use payments_gateway::circuit::store_redis::CircuitStoreRedis;
@@ -97,6 +98,25 @@ async fn main() -> anyhow::Result<()> {
         redis_client: redis::Client::open(cfg.redis_url.clone())?,
     };
 
+    let admin_key = cfg.internal_api_key.clone();
+    let admin_routes = Router::new()
+        .route(
+            "/retry-policy/:merchant_id",
+            put(payments_gateway::http::handlers::retry_policy::upsert_retry_policy),
+        )
+        .route(
+            "/circuit-breaker/force-open/:gateway/:method",
+            post(payments_gateway::http::handlers::circuit_breaker::force_open),
+        )
+        .route(
+            "/circuit-breaker/force-close/:gateway/:method",
+            post(payments_gateway::http::handlers::circuit_breaker::force_close),
+        )
+        .layer(from_fn_with_state(
+            admin_key,
+            payments_gateway::http::middleware::admin_auth::require_internal_api_key,
+        ));
+
     let app = Router::new()
         .route("/health", get(payments_gateway::http::handlers::payments::health))
         .route("/payments", post(payments_gateway::http::handlers::payments::create_payment))
@@ -130,13 +150,10 @@ async fn main() -> anyhow::Result<()> {
             get(payments_gateway::http::handlers::circuit_breaker::status),
         )
         .route(
-            "/circuit-breaker/force-open/:gateway/:method",
-            post(payments_gateway::http::handlers::circuit_breaker::force_open),
+            "/retry-policy/:merchant_id",
+            get(payments_gateway::http::handlers::retry_policy::get_retry_policy),
         )
-        .route(
-            "/circuit-breaker/force-close/:gateway/:method",
-            post(payments_gateway::http::handlers::circuit_breaker::force_close),
-        )
+        .merge(admin_routes)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;

@@ -6,12 +6,16 @@ pub mod domain {
 }
 pub mod gateways;
 pub mod http {
+    pub mod middleware {
+        pub mod admin_auth;
+    }
     pub mod handlers {
         pub mod circuit_breaker;
         pub mod gateways;
         pub mod metrics;
         pub mod payment_attempts;
         pub mod payments;
+        pub mod retry_policy;
         pub mod routing_decisions;
         pub mod scoring_debug;
     }
