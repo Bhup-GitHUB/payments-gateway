@@ -15,6 +15,7 @@ use crate::metrics::event::PaymentEvent;
 use crate::metrics::store_redis::MetricsHotStore;
 use crate::repo::circuit_breaker_config_repo::CircuitBreakerConfigRepo;
 use crate::repo::error_classification_repo::ErrorClassificationRepo;
+use crate::repo::bandit_repo::BanditRepo;
 use crate::repo::experiments_repo::ExperimentsRepo;
 use crate::repo::gateways_repo::GatewaysRepo;
 use crate::repo::outbox_repo::OutboxRepo;
@@ -44,6 +45,7 @@ pub struct PaymentService {
     pub outbox_repo: OutboxRepo,
     pub gateways_repo: GatewaysRepo,
     pub experiments_repo: ExperimentsRepo,
+    pub bandit_repo: BanditRepo,
     pub scoring_config_repo: ScoringConfigRepo,
     pub routing_decisions_repo: RoutingDecisionsRepo,
     pub circuit_breaker_config_repo: CircuitBreakerConfigRepo,
@@ -184,7 +186,14 @@ impl PaymentService {
         }
 
         let ranked = rank_gateways(&candidates, &to_weights(&weights));
-        let ranked = apply_experiment_override(ranked, experiment_ctx.as_ref().and_then(|c| c.forced_gateway.clone()));
+        let mut ranked = apply_experiment_override(ranked, experiment_ctx.as_ref().and_then(|c| c.forced_gateway.clone()));
+        let bandit_segment = format!(\"{}:{}\", method, amount_bucket);
+        if experiment_ctx.as_ref().and_then(|c| c.forced_gateway.clone()).is_none() {
+            ranked = self
+                .apply_bandit_if_enabled(&bandit_segment, ranked)
+                .await
+                .map_err(internal)?;
+        }
         if ranked.is_empty() {
             return Err((
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -443,6 +452,15 @@ impl PaymentService {
                 .map_err(internal)?;
         }
 
+        let _ = self
+            .bandit_repo
+            .update_outcome(
+                &bandit_segment,
+                &selected.gateway_id,
+                matches!(gateway_result.response.status, PaymentStatus::Success),
+            )
+            .await;
+
         Ok(CreatePaymentResponse {
             payment_id,
             status: gateway_result.response.status,
@@ -636,6 +654,31 @@ impl PaymentService {
         }
 
         Ok(None)
+    }
+
+    async fn apply_bandit_if_enabled(
+        &self,
+        segment: &str,
+        ranked: Vec<RankedGateway>,
+    ) -> anyhow::Result<Vec<RankedGateway>> {
+        if !self.bandit_repo.is_enabled(segment).await? {
+            return Ok(ranked);
+        }
+
+        let gateway_ids: Vec<String> = ranked.iter().map(|r| r.gateway_id.clone()).collect();
+        let sampled = self.bandit_repo.sample_scores(segment, &gateway_ids).await?;
+        let mut score_map = std::collections::HashMap::new();
+        for (gateway, score) in sampled {
+            score_map.insert(gateway, score);
+        }
+
+        let mut reordered = ranked;
+        reordered.sort_by(|a, b| {
+            let sa = score_map.get(&a.gateway_id).copied().unwrap_or(0.0);
+            let sb = score_map.get(&b.gateway_id).copied().unwrap_or(0.0);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(reordered)
     }
 }
 

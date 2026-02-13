@@ -10,6 +10,7 @@ axum = { version = "0.7", features = ["macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 http = "1"
 rand = "0.8"
+rand_distr = "0.4"
 redis = { version = "0.27", features = ["aio", "tokio-comp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

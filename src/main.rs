@@ -6,6 +6,7 @@ use payments_gateway::circuit::store_redis::CircuitStoreRedis;
 use payments_gateway::gateways::razorpay::RazorpayGateway;
 use payments_gateway::metrics::store_redis::MetricsHotStore;
 use payments_gateway::repo::circuit_breaker_config_repo::CircuitBreakerConfigRepo;
+use payments_gateway::repo::bandit_repo::BanditRepo;
 use payments_gateway::repo::error_classification_repo::ErrorClassificationRepo;
 use payments_gateway::repo::experiments_repo::ExperimentsRepo;
 use payments_gateway::repo::gateways_repo::GatewaysRepo;
@@ -52,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
     let error_classification_repo = ErrorClassificationRepo { pool: pool.clone() };
     let payment_verification_repo = PaymentVerificationRepo { pool: pool.clone() };
     let experiments_repo = ExperimentsRepo { pool: pool.clone() };
+    let bandit_repo = BanditRepo { pool: pool.clone() };
     let razorpay = Arc::new(RazorpayGateway {
         base_url: std::env::var("RAZORPAY_BASE_URL")
             .unwrap_or_else(|_| "https://api.razorpay.com".to_string()),
@@ -70,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         outbox_repo: outbox_repo.clone(),
         gateways_repo: gateways_repo.clone(),
         experiments_repo: experiments_repo.clone(),
+        bandit_repo: bandit_repo.clone(),
         scoring_config_repo,
         routing_decisions_repo: routing_decisions_repo.clone(),
         circuit_breaker_config_repo: circuit_breaker_config_repo.clone(),
@@ -99,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         payment_attempts_repo,
         retry_policy_repo,
         payment_verification_repo,
+        bandit_repo: bandit_repo.clone(),
         redis_client: redis::Client::open(cfg.redis_url.clone())?,
     };
 
@@ -123,6 +127,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/experiments/:id/stop",
             post(payments_gateway::http::handlers::experiments::stop_experiment),
+        )
+        .route(
+            "/bandit/policy/:segment/enable",
+            post(payments_gateway::http::handlers::bandit::enable_segment),
         )
         .layer(from_fn_with_state(
             admin_key,
@@ -174,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
             "/experiments/:id/winner",
             get(payments_gateway::http::handlers::experiment_winner::get_experiment_winner),
         )
+        .route("/bandit/state", get(payments_gateway::http::handlers::bandit::get_state))
         .merge(admin_routes)
         .with_state(state);
 

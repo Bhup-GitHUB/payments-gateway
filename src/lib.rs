@@ -11,6 +11,7 @@ pub mod http {
         pub mod admin_auth;
     }
     pub mod handlers {
+        pub mod bandit;
         pub mod circuit_breaker;
         pub mod experiment_winner;
         pub mod experiments;
@@ -25,6 +26,7 @@ pub mod http {
 }
 pub mod metrics;
 pub mod repo {
+    pub mod bandit_repo;
     pub mod circuit_breaker_config_repo;
     pub mod error_classification_repo;
     pub mod gateways_repo;
@@ -42,6 +44,7 @@ pub mod router {
 }
 pub mod scoring;
 pub mod circuit;
+pub mod bandit;
 pub mod experiments;
 pub mod service {
     pub mod outbox_relay;
@@ -60,5 +63,6 @@ pub struct AppState {
     pub payment_attempts_repo: repo::payment_attempts_repo::PaymentAttemptsRepo,
     pub retry_policy_repo: repo::retry_policy_repo::RetryPolicyRepo,
     pub payment_verification_repo: repo::payment_verification_repo::PaymentVerificationRepo,
+    pub bandit_repo: repo::bandit_repo::BanditRepo,
     pub redis_client: redis::Client,
 }
