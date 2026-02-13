@@ -11,6 +11,34 @@ pub struct WinnerAnalysis {
     pub recommendation: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct GuardrailConfig {
+    pub min_samples: i64,
+    pub max_success_rate_drop: f64,
+    pub max_latency_multiplier: f64,
+}
+
+impl Default for GuardrailConfig {
+    fn default() -> Self {
+        Self {
+            min_samples: 100,
+            max_success_rate_drop: 0.05,
+            max_latency_multiplier: 1.5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GuardrailDecision {
+    pub should_pause: bool,
+    pub reason: Option<String>,
+    pub control_success_rate: f64,
+    pub treatment_success_rate: f64,
+    pub control_p95_latency_ms: i32,
+    pub treatment_p95_latency_ms: i32,
+    pub treatment_total_requests: i64,
+}
+
 pub fn analyze(results: &[ExperimentResultRow], min_samples: i64) -> WinnerAnalysis {
     let (c_total, c_success) = aggregate_variant(results, "control");
     let (t_total, t_success) = aggregate_variant(results, "treatment");
@@ -72,6 +100,64 @@ pub fn analyze(results: &[ExperimentResultRow], min_samples: i64) -> WinnerAnaly
     }
 }
 
+pub fn evaluate_guardrails(results: &[ExperimentResultRow], config: &GuardrailConfig) -> GuardrailDecision {
+    let (control_total, control_success) = aggregate_variant(results, "control");
+    let (treatment_total, treatment_success) = aggregate_variant(results, "treatment");
+    let control_success_rate = ratio(control_success, control_total);
+    let treatment_success_rate = ratio(treatment_success, treatment_total);
+    let control_p95 = max_p95(results, "control");
+    let treatment_p95 = max_p95(results, "treatment");
+
+    if treatment_total < config.min_samples {
+        return GuardrailDecision {
+            should_pause: false,
+            reason: None,
+            control_success_rate,
+            treatment_success_rate,
+            control_p95_latency_ms: control_p95,
+            treatment_p95_latency_ms: treatment_p95,
+            treatment_total_requests: treatment_total,
+        };
+    }
+
+    if treatment_success_rate + config.max_success_rate_drop < control_success_rate {
+        return GuardrailDecision {
+            should_pause: true,
+            reason: Some("treatment_success_rate_below_guardrail".to_string()),
+            control_success_rate,
+            treatment_success_rate,
+            control_p95_latency_ms: control_p95,
+            treatment_p95_latency_ms: treatment_p95,
+            treatment_total_requests: treatment_total,
+        };
+    }
+
+    if control_p95 > 0
+        && treatment_p95 > 0
+        && (treatment_p95 as f64) > (control_p95 as f64 * config.max_latency_multiplier)
+    {
+        return GuardrailDecision {
+            should_pause: true,
+            reason: Some("treatment_latency_above_guardrail".to_string()),
+            control_success_rate,
+            treatment_success_rate,
+            control_p95_latency_ms: control_p95,
+            treatment_p95_latency_ms: treatment_p95,
+            treatment_total_requests: treatment_total,
+        };
+    }
+
+    GuardrailDecision {
+        should_pause: false,
+        reason: None,
+        control_success_rate,
+        treatment_success_rate,
+        control_p95_latency_ms: control_p95,
+        treatment_p95_latency_ms: treatment_p95,
+        treatment_total_requests: treatment_total,
+    }
+}
+
 fn aggregate_variant(results: &[ExperimentResultRow], variant: &str) -> (i64, i64) {
     let mut total = 0_i64;
     let mut success = 0_i64;
@@ -82,6 +168,15 @@ fn aggregate_variant(results: &[ExperimentResultRow], variant: &str) -> (i64, i6
         }
     }
     (total, success)
+}
+
+fn max_p95(results: &[ExperimentResultRow], variant: &str) -> i32 {
+    results
+        .iter()
+        .filter(|r| r.variant == variant)
+        .map(|r| r.p95_latency_ms)
+        .max()
+        .unwrap_or(0)
 }
 
 fn ratio(a: i64, b: i64) -> f64 {

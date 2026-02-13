@@ -22,6 +22,7 @@ Rust + Axum payment API implementing Phase 1 to Phase 7 foundations with scoring
 - `GET /experiments/:id/winner`
 - `POST /experiments/:id/stop` (admin key)
 - `POST /bandit/policy/:segment/enable` (admin key)
+- `POST /bandit/policy/:segment/disable` (admin key)
 - `GET /bandit/state`
 - `GET /ops/readiness`
 - `GET /ops/liveness`
@@ -42,7 +43,7 @@ Rust + Axum payment API implementing Phase 1 to Phase 7 foundations with scoring
 - `metrics_worker` consumes stream and updates:
   - hot metrics in Redis
   - historical snapshots in Postgres `gateway_metrics`
-- `experiment_analyzer` computes significance recommendations.
+- `experiment_analyzer` computes significance recommendations and auto-pauses harmful treatments.
 - `payment_verifier` processes pending verification queue.
 
 ## Required env
@@ -57,6 +58,9 @@ Rust + Axum payment API implementing Phase 1 to Phase 7 foundations with scoring
 - `METRICS_STREAM_GROUP` (default: `metrics-agg-v1`)
 - `METRICS_CONSUMER_NAME` (worker only, default: `metrics-worker-1`)
 - `INTERNAL_API_KEY` (default: `dev-internal-key`)
+- `EXPERIMENT_GUARDRAIL_MIN_SAMPLES` (default: `100`)
+- `EXPERIMENT_GUARDRAIL_MAX_SUCCESS_DROP` (default: `0.05`)
+- `EXPERIMENT_GUARDRAIL_MAX_LATENCY_MULTIPLIER` (default: `1.5`)
 
 ## Run API
 ```bash

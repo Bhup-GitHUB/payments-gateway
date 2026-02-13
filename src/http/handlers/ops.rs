@@ -24,8 +24,21 @@ pub async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
         .await
         .map(|_| true)
         .unwrap_or(false);
+    let stream_ok = async {
+        if let Ok(mut conn) = state.redis_client.get_multiplexed_async_connection().await {
+            let exists: redis::RedisResult<i32> =
+                redis::cmd("EXISTS").arg(&state.stream_key).query_async(&mut conn).await;
+            return exists.is_ok();
+        }
+        false
+    }
+    .await;
+    let outbox_ok = sqlx::query("SELECT 1 FROM outbox LIMIT 1")
+        .execute(&state.payment_service.pool)
+        .await
+        .is_ok();
 
-    let ok = db_ok && redis_ok;
+    let ok = db_ok && redis_ok && stream_ok && worker_hint && outbox_ok;
     let status = if ok {
         axum::http::StatusCode::OK
     } else {
@@ -38,7 +51,9 @@ pub async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
             "ready": ok,
             "db": db_ok,
             "redis": redis_ok,
-            "verification_repo": worker_hint
+            "stream": stream_ok,
+            "verification_worker": worker_hint,
+            "outbox_repo": outbox_ok
         })),
     )
         .into_response()

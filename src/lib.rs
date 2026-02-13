@@ -72,4 +72,5 @@ pub struct AppState {
     pub redis_client: redis::Client,
     pub webhook_dispatcher: service::webhook_dispatcher::WebhookDispatcher,
     pub config_cache: service::config_cache::ConfigCache,
+    pub stream_key: String,
 }

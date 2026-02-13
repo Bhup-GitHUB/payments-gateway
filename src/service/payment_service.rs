@@ -189,7 +189,7 @@ impl PaymentService {
 
         let ranked = rank_gateways(&candidates, &to_weights(&weights));
         let mut ranked = apply_experiment_override(ranked, experiment_ctx.as_ref().and_then(|c| c.forced_gateway.clone()));
-        let bandit_segment = format!(\"{}:{}\", method, amount_bucket);
+        let bandit_segment = format!("{}:{}", method, amount_bucket);
         if experiment_ctx.as_ref().and_then(|c| c.forced_gateway.clone()).is_none() {
             ranked = self
                 .apply_bandit_if_enabled(&bandit_segment, ranked)
@@ -583,6 +583,7 @@ impl PaymentService {
             .await?;
 
         let prev_state = format!("{:?}", snapshot.state);
+        let prev_failure_rate = snapshot.failure_rate_2m;
         let updated = apply_transition(
             snapshot,
             &thresholds,
@@ -613,6 +614,21 @@ impl PaymentService {
                         "to_state": next_state,
                         "failure_rate_2m": updated.failure_rate_2m,
                         "timeout_rate_5m": updated.timeout_rate_5m
+                    }),
+                )
+                .await;
+        }
+        let severe_drop_threshold = (thresholds.failure_rate_threshold_2m * 0.8).max(0.25);
+        if prev_failure_rate < severe_drop_threshold && updated.failure_rate_2m >= severe_drop_threshold {
+            let _ = self
+                .webhook_dispatcher
+                .emit(
+                    "reliability.success_rate_drop",
+                    serde_json::json!({
+                        "gateway_id": gateway_id,
+                        "method": method,
+                        "failure_rate_2m": updated.failure_rate_2m,
+                        "threshold": severe_drop_threshold
                     }),
                 )
                 .await;

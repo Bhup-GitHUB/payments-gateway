@@ -1,5 +1,5 @@
 use payments_gateway::domain::experiment::{ExperimentFilter, ExperimentResultRow};
-use payments_gateway::experiments::analyzer::analyze;
+use payments_gateway::experiments::analyzer::{analyze, evaluate_guardrails, GuardrailConfig};
 use payments_gateway::experiments::assigner::assign_variant;
 use payments_gateway::experiments::filter::{matches, MatchInput};
 use uuid::Uuid;
@@ -66,4 +66,45 @@ fn z_test_returns_winner_for_clear_gap() {
     let out = analyze(&rows, 100);
     assert!(out.is_significant);
     assert_eq!(out.winner.as_deref(), Some("treatment"));
+}
+
+#[test]
+fn guardrail_flags_harmful_treatment() {
+    let experiment_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let rows = vec![
+        ExperimentResultRow {
+            experiment_id,
+            variant: "control".to_string(),
+            date_hour: now,
+            total_requests: 1000,
+            successful_requests: 950,
+            failed_requests: 50,
+            avg_latency_ms: 1700,
+            p95_latency_ms: 1900,
+            total_revenue_minor: 100,
+        },
+        ExperimentResultRow {
+            experiment_id,
+            variant: "treatment".to_string(),
+            date_hour: now,
+            total_requests: 1000,
+            successful_requests: 860,
+            failed_requests: 140,
+            avg_latency_ms: 1800,
+            p95_latency_ms: 2200,
+            total_revenue_minor: 100,
+        },
+    ];
+
+    let decision = evaluate_guardrails(
+        &rows,
+        &GuardrailConfig {
+            min_samples: 100,
+            max_success_rate_drop: 0.05,
+            max_latency_multiplier: 1.5,
+        },
+    );
+
+    assert!(decision.should_pause);
 }

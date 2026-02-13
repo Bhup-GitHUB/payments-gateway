@@ -116,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         redis_client: redis::Client::open(cfg.redis_url.clone())?,
         webhook_dispatcher: webhook_dispatcher.clone(),
         config_cache,
+        stream_key: cfg.stream_key.clone(),
     };
 
     let admin_key = cfg.internal_api_key.clone();
@@ -143,6 +144,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/bandit/policy/:segment/enable",
             post(payments_gateway::http::handlers::bandit::enable_segment),
+        )
+        .route(
+            "/bandit/policy/:segment/disable",
+            post(payments_gateway::http::handlers::bandit::disable_segment),
         )
         .layer(from_fn_with_state(
             admin_key,
