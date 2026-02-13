@@ -1,6 +1,7 @@
 use axum::routing::{get, patch, post};
 use axum::Router;
 use payments_gateway::config::AppConfig;
+use payments_gateway::circuit::store_redis::CircuitStoreRedis;
 use payments_gateway::gateways::razorpay::RazorpayGateway;
 use payments_gateway::metrics::store_redis::MetricsHotStore;
 use payments_gateway::repo::circuit_breaker_config_repo::CircuitBreakerConfigRepo;
@@ -13,6 +14,7 @@ use payments_gateway::service::outbox_relay::OutboxRelay;
 use payments_gateway::service::payment_service::PaymentService;
 use payments_gateway::AppState;
 use sqlx::postgres::PgPoolOptions;
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -58,7 +60,9 @@ async fn main() -> anyhow::Result<()> {
         gateways_repo: gateways_repo.clone(),
         scoring_config_repo,
         routing_decisions_repo: routing_decisions_repo.clone(),
+        circuit_breaker_config_repo: circuit_breaker_config_repo.clone(),
         metrics_hot_store: metrics_hot_store.clone(),
+        circuit_store: CircuitStoreRedis::new(redis::Client::open(cfg.redis_url.clone())?),
         razorpay,
     };
 

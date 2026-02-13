@@ -1,12 +1,17 @@
+use crate::circuit::evaluator::pre_call_decision;
+use crate::circuit::state::CircuitDecision;
+use crate::circuit::store_redis::CircuitStoreRedis;
+use crate::circuit::transitions::apply_transition;
 use crate::domain::context::build_context;
-use crate::domain::payment::{CreatePaymentRequest, CreatePaymentResponse, ErrorEnvelope, ErrorPayload, PaymentStatus};
 use crate::domain::payment::PaymentInstrument;
+use crate::domain::payment::{CreatePaymentRequest, CreatePaymentResponse, ErrorEnvelope, ErrorPayload, PaymentStatus};
 use crate::gateways::mock::MockGateway;
 use crate::gateways::razorpay::RazorpayGateway;
 use crate::gateways::{GatewayRequest, PaymentGateway};
 use crate::metrics::amount_bucket::from_amount_minor;
 use crate::metrics::event::PaymentEvent;
 use crate::metrics::store_redis::MetricsHotStore;
+use crate::repo::circuit_breaker_config_repo::CircuitBreakerConfigRepo;
 use crate::repo::gateways_repo::GatewaysRepo;
 use crate::repo::outbox_repo::OutboxRepo;
 use crate::repo::payments_repo::{PaymentRecordInput, PaymentsRepo};
@@ -14,7 +19,7 @@ use crate::repo::routing_decisions_repo::RoutingDecisionsRepo;
 use crate::repo::scoring_config_repo::ScoringConfigRepo;
 use crate::scoring::engine::rank_gateways;
 use crate::scoring::metrics_reader::read_metric_for_gateway;
-use crate::scoring::types::{GatewayCandidate, ScoreInputs, ScoreWeights};
+use crate::scoring::types::{GatewayCandidate, RankedGateway, ScoreInputs, ScoreWeights};
 use axum::http::HeaderMap;
 use sqlx::PgPool;
 use std::collections::hash_map::DefaultHasher;
@@ -31,7 +36,9 @@ pub struct PaymentService {
     pub gateways_repo: GatewaysRepo,
     pub scoring_config_repo: ScoringConfigRepo,
     pub routing_decisions_repo: RoutingDecisionsRepo,
+    pub circuit_breaker_config_repo: CircuitBreakerConfigRepo,
     pub metrics_hot_store: MetricsHotStore,
+    pub circuit_store: CircuitStoreRedis,
     pub razorpay: Arc<RazorpayGateway>,
 }
 
@@ -159,12 +166,23 @@ impl PaymentService {
         }
 
         let ranked = rank_gateways(&candidates, &to_weights(&weights));
-        let selected = ranked.first().ok_or_else(|| {
-            (
+        if ranked.is_empty() {
+            return Err((
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 err("ROUTER_SELECTION_FAILED", "failed to score gateway candidates"),
-            )
-        })?;
+            ));
+        }
+
+        let (selected, selected_was_probe) = self
+            .pick_circuit_eligible(&ranked, &method)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    err("NO_GATEWAY_AVAILABLE", "all candidate gateways are circuit-open"),
+                )
+            })?;
 
         let selected_gateway = candidates
             .iter()
@@ -207,7 +225,10 @@ impl PaymentService {
         let routing_reason = format!(
             "top_score={:.4}, runner_up={}",
             selected.score,
-            ranked.get(1).map(|r| r.gateway_id.clone()).unwrap_or_else(|| "none".to_string())
+            ranked
+                .get(1)
+                .map(|r| r.gateway_id.clone())
+                .unwrap_or_else(|| "none".to_string())
         );
 
         let payment_input = PaymentRecordInput {
@@ -268,6 +289,15 @@ impl PaymentService {
             .await
             .map_err(internal)?;
 
+        self.update_circuit_state(
+            &selected.gateway_id,
+            &method,
+            &format!("{:?}", gateway_result.response.status).to_uppercase(),
+            selected_was_probe,
+        )
+        .await
+        .map_err(internal)?;
+
         Ok(CreatePaymentResponse {
             payment_id,
             status: gateway_result.response.status,
@@ -277,6 +307,83 @@ impl PaymentService {
             routing_reason,
             latency_ms,
         })
+    }
+
+    async fn pick_circuit_eligible(
+        &self,
+        ranked: &[RankedGateway],
+        method: &str,
+    ) -> anyhow::Result<Option<(RankedGateway, bool)>> {
+        for candidate in ranked {
+            let override_state = self
+                .circuit_store
+                .get_override(&candidate.gateway_id, method)
+                .await?;
+
+            if override_state.as_deref() == Some("FORCE_OPEN") {
+                continue;
+            }
+            if override_state.as_deref() == Some("FORCE_CLOSED") {
+                return Ok(Some((candidate.clone(), false)));
+            }
+
+            let thresholds = self
+                .circuit_breaker_config_repo
+                .get_thresholds(&candidate.gateway_id, method)
+                .await?;
+            let snapshot = self
+                .circuit_store
+                .get_snapshot(&candidate.gateway_id, method)
+                .await?;
+
+            match pre_call_decision(&snapshot, &thresholds, chrono::Utc::now()) {
+                CircuitDecision::Allow => return Ok(Some((candidate.clone(), false))),
+                CircuitDecision::Probe => return Ok(Some((candidate.clone(), true))),
+                CircuitDecision::Reject(_) => {}
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn update_circuit_state(
+        &self,
+        gateway_id: &str,
+        method: &str,
+        status: &str,
+        was_probe: bool,
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now();
+        self.circuit_store
+            .write_result(gateway_id, method, status, now)
+            .await?;
+
+        let snapshot = self.circuit_store.get_snapshot(gateway_id, method).await?;
+        let thresholds = self
+            .circuit_breaker_config_repo
+            .get_thresholds(gateway_id, method)
+            .await?;
+        let (failure_rate_2m, _) = self
+            .circuit_store
+            .aggregate_window(gateway_id, method, 2, now)
+            .await?;
+        let (_, timeout_rate_5m) = self
+            .circuit_store
+            .aggregate_window(gateway_id, method, 5, now)
+            .await?;
+
+        let updated = apply_transition(
+            snapshot,
+            &thresholds,
+            failure_rate_2m,
+            timeout_rate_5m,
+            status,
+            was_probe,
+            now,
+        );
+
+        self.circuit_store.save_snapshot(&updated).await?;
+        Ok(())
     }
 
     async fn resolve_issuing_bank(
