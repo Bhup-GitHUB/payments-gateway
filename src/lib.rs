@@ -10,6 +10,7 @@ pub mod http {
         pub mod circuit_breaker;
         pub mod gateways;
         pub mod metrics;
+        pub mod payment_attempts;
         pub mod payments;
         pub mod routing_decisions;
         pub mod scoring_debug;

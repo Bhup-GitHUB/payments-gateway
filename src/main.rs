@@ -104,6 +104,14 @@ async fn main() -> anyhow::Result<()> {
             "/payments/:payment_id/routing-decision",
             get(payments_gateway::http::handlers::routing_decisions::get_routing_decision),
         )
+        .route(
+            "/payments/:payment_id/attempts",
+            get(payments_gateway::http::handlers::payment_attempts::list_attempts),
+        )
+        .route(
+            "/payments/:payment_id/status-verification",
+            get(payments_gateway::http::handlers::payment_attempts::get_status_verification),
+        )
         .route("/gateways", get(payments_gateway::http::handlers::gateways::list_gateways))
         .route(
             "/gateways/:gateway_id",
