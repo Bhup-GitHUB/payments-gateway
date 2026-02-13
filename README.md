@@ -14,32 +14,9 @@ This service processes payments across multiple gateways with:
 
 ## System design
 
-```mermaid
-flowchart LR
-    A[Client] --> B[POST /payments]
-    B --> C[PaymentService]
-    C --> D[Build Context]
-    D --> E[Experiment Assignment]
-    E --> F[Scoring Engine]
-    F --> G[Bandit Reorder if enabled]
-    G --> H[Circuit Check]
-    H --> I[Retry Orchestrator]
-    I --> J[Gateway Adapter]
-    J --> K[Gateway Response]
-    K --> L[Persist Payment + Attempts + Routing Decision]
-    L --> M[Outbox Event]
-    M --> N[Redis Stream]
-    N --> O[Metrics Worker]
-    O --> P[Redis Hot Metrics]
-    O --> Q[Postgres Historical Metrics]
-
-    K --> R{Status}
-    R -->|SUCCESS| S[Return Success]
-    R -->|FAILURE| T[Classify Error and Retry if allowed]
-    R -->|TIMEOUT| U[Mark PENDING_VERIFICATION]
-    U --> V[Verification Queue]
-    V --> W[payment_verifier]
-```
+<p align="left">
+  <img src="Screenshot 2026-02-12 at 4.46.31 PM.png" alt="Payment gateway architecture" width="760" />
+</p>
 
 ## Request lifecycle
 
