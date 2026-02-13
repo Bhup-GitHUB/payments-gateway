@@ -2,12 +2,6 @@
 
 Production-focused payment routing service in Rust + Axum.
 
-## Architecture image
-
-<p align="left">
-  <img src="Screenshot 2026-02-12 at 4.46.31 PM.png" alt="Payment gateway architecture" width="760" />
-</p>
-
 This service processes payments across multiple gateways with:
 - deterministic fallback and retry policies
 - timeout-safe `PENDING_VERIFICATION` flow
