@@ -1,6 +1,7 @@
 pub mod config;
 pub mod domain {
     pub mod context;
+    pub mod experiment;
     pub mod payment;
     pub mod routing_decision;
 }
@@ -29,6 +30,7 @@ pub mod repo {
     pub mod payment_attempts_repo;
     pub mod payment_verification_repo;
     pub mod payments_repo;
+    pub mod experiments_repo;
     pub mod routing_decisions_repo;
     pub mod retry_policy_repo;
     pub mod scoring_config_repo;
