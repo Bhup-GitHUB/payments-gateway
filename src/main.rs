@@ -102,6 +102,18 @@ async fn main() -> anyhow::Result<()> {
             "/scoring/debug",
             get(payments_gateway::http::handlers::scoring_debug::scoring_debug),
         )
+        .route(
+            "/circuit-breaker/status",
+            get(payments_gateway::http::handlers::circuit_breaker::status),
+        )
+        .route(
+            "/circuit-breaker/force-open/:gateway/:method",
+            post(payments_gateway::http::handlers::circuit_breaker::force_open),
+        )
+        .route(
+            "/circuit-breaker/force-close/:gateway/:method",
+            post(payments_gateway::http::handlers::circuit_breaker::force_close),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
