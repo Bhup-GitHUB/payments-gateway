@@ -13,11 +13,7 @@ pub async fn read_metric_for_gateway(
     method: &str,
     bank: &str,
 ) -> Result<GatewayMetricInput> {
-    let entries = store
-        .read_gateway_metrics(gateway, 5, Some(method), Some(bank))
-        .await?;
-
-    if let Some((_, _, metric)) = entries.into_iter().next() {
+    if let Some(metric) = store.read_single_metric(gateway, method, bank, 5).await? {
         return Ok(GatewayMetricInput {
             success_rate: metric.success_rate,
             p95_latency_ms: metric.p95_latency_ms,

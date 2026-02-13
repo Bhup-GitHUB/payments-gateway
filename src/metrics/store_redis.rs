@@ -79,4 +79,23 @@ impl MetricsHotStore {
 
         Ok(out)
     }
+
+    pub async fn read_single_metric(
+        &self,
+        gateway: &str,
+        method: &str,
+        bank: &str,
+        window: i64,
+    ) -> Result<Option<AggregatedMetric>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let redis_key = format!(
+            "metrics:{}:{}:{}:{}m",
+            gateway.to_lowercase(),
+            method.to_lowercase(),
+            bank.to_lowercase(),
+            window
+        );
+        let payload: Option<String> = conn.get(redis_key).await.ok();
+        Ok(payload.and_then(|p| serde_json::from_str::<AggregatedMetric>(&p).ok()))
+    }
 }
