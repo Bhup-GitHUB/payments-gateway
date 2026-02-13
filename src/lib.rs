@@ -13,13 +13,18 @@ pub mod http {
 }
 pub mod metrics;
 pub mod repo {
+    pub mod circuit_breaker_config_repo;
     pub mod gateways_repo;
     pub mod outbox_repo;
     pub mod payments_repo;
+    pub mod routing_decisions_repo;
+    pub mod scoring_config_repo;
 }
 pub mod router {
     pub mod round_robin;
 }
+pub mod scoring;
+pub mod circuit;
 pub mod service {
     pub mod outbox_relay;
     pub mod payment_service;
