@@ -1,19 +1,33 @@
 # payments-gateway
 
-Rust + Axum payment API implementing Phase 1, Phase 2, and Phase 3 foundations.
+Rust + Axum payment API implementing Phase 1 to Phase 5 foundations.
 
 ## APIs
 - `POST /payments`
+- `GET /payments/:payment_id/routing-decision`
 - `GET /gateways`
 - `PATCH /gateways/:gateway_id`
 - `GET /metrics/gateways/:gateway_name`
+- `GET /scoring/debug`
+- `GET /circuit-breaker/status`
+- `POST /circuit-breaker/force-open/:gateway/:method`
+- `POST /circuit-breaker/force-close/:gateway/:method`
 
-## Phase 3 architecture
-- `POST /payments` persists payment and outbox event in one DB transaction.
-- API background relay publishes outbox events to Redis Stream.
-- `metrics_worker` consumes stream events.
-- Worker computes 1m/5m/15m/60m metrics and writes hot metrics to Redis.
-- Worker writes historical snapshots to Postgres `gateway_metrics`.
+## Routing flow
+- Build payment context.
+- Load enabled gateways for payment method.
+- Read live metrics from Redis.
+- Score each gateway with weighted scoring engine.
+- Filter candidates through circuit breaker state.
+- Execute selected gateway.
+- Persist payment, outbox event, and routing decision.
+
+## Metrics and event pipeline
+- `POST /payments` writes payment + outbox in one DB transaction.
+- API relay publishes outbox events to Redis Stream.
+- `metrics_worker` consumes events and writes:
+  - hot metrics in Redis
+  - historical snapshots in Postgres `gateway_metrics`
 
 ## Required env
 - `DATABASE_URL` (default: `postgres://postgres:postgres@localhost:5432/payments_gateway`)
@@ -54,7 +68,17 @@ curl -X POST http://localhost:3000/payments \
   }'
 ```
 
-## Example metrics request
+## Example routing decision request
 ```bash
-curl "http://localhost:3000/metrics/gateways/razorpay_real?window=5m"
+curl "http://localhost:3000/payments/<payment_id>/routing-decision"
+```
+
+## Example scoring debug request
+```bash
+curl "http://localhost:3000/scoring/debug?amount_minor=250000&payment_method=UPI&issuing_bank=HDFC"
+```
+
+## Example circuit status request
+```bash
+curl "http://localhost:3000/circuit-breaker/status"
 ```
