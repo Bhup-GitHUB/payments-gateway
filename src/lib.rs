@@ -40,6 +40,7 @@ pub mod router {
 }
 pub mod scoring;
 pub mod circuit;
+pub mod experiments;
 pub mod service {
     pub mod outbox_relay;
     pub mod payment_service;
