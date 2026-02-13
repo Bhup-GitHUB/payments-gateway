@@ -9,6 +9,7 @@ pub mod gateways;
 pub mod http {
     pub mod middleware {
         pub mod admin_auth;
+        pub mod rate_limit;
     }
     pub mod handlers {
         pub mod bandit;
@@ -17,6 +18,7 @@ pub mod http {
         pub mod experiments;
         pub mod gateways;
         pub mod metrics;
+        pub mod ops;
         pub mod payment_attempts;
         pub mod payments;
         pub mod retry_policy;
@@ -38,6 +40,7 @@ pub mod repo {
     pub mod routing_decisions_repo;
     pub mod retry_policy_repo;
     pub mod scoring_config_repo;
+    pub mod webhook_repo;
 }
 pub mod router {
     pub mod round_robin;
@@ -47,9 +50,11 @@ pub mod circuit;
 pub mod bandit;
 pub mod experiments;
 pub mod service {
+    pub mod config_cache;
     pub mod outbox_relay;
     pub mod payment_service;
     pub mod retry_orchestrator;
+    pub mod webhook_dispatcher;
 }
 
 #[derive(Clone)]
@@ -65,4 +70,6 @@ pub struct AppState {
     pub payment_verification_repo: repo::payment_verification_repo::PaymentVerificationRepo,
     pub bandit_repo: repo::bandit_repo::BanditRepo,
     pub redis_client: redis::Client,
+    pub webhook_dispatcher: service::webhook_dispatcher::WebhookDispatcher,
+    pub config_cache: service::config_cache::ConfigCache,
 }

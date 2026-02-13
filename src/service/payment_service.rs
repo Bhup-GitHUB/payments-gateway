@@ -29,6 +29,7 @@ use crate::scoring::engine::rank_gateways;
 use crate::scoring::metrics_reader::read_metric_for_gateway;
 use crate::scoring::types::{GatewayCandidate, RankedGateway, ScoreInputs, ScoreWeights};
 use crate::service::retry_orchestrator::{attempt_limit, classify_attempt_result, should_stop_for_budget, RetryDirective};
+use crate::service::webhook_dispatcher::WebhookDispatcher;
 use axum::http::HeaderMap;
 use chrono::Timelike;
 use sqlx::PgPool;
@@ -55,6 +56,7 @@ pub struct PaymentService {
     pub retry_policy_repo: RetryPolicyRepo,
     pub error_classification_repo: ErrorClassificationRepo,
     pub payment_verification_repo: PaymentVerificationRepo,
+    pub webhook_dispatcher: WebhookDispatcher,
     pub razorpay: Arc<RazorpayGateway>,
 }
 
@@ -580,6 +582,7 @@ impl PaymentService {
             .aggregate_window(gateway_id, method, 5, now)
             .await?;
 
+        let prev_state = format!("{:?}", snapshot.state);
         let updated = apply_transition(
             snapshot,
             &thresholds,
@@ -589,6 +592,31 @@ impl PaymentService {
             was_probe,
             now,
         );
+
+        let next_state = format!("{:?}", updated.state);
+        if next_state != prev_state {
+            let event_type = if format!("{:?}", updated.state) == "Open" {
+                "circuit.opened"
+            } else if format!("{:?}", updated.state) == "Closed" {
+                "circuit.closed"
+            } else {
+                "circuit.half_open"
+            };
+            let _ = self
+                .webhook_dispatcher
+                .emit(
+                    event_type,
+                    serde_json::json!({
+                        "gateway_id": gateway_id,
+                        "method": method,
+                        "from_state": prev_state,
+                        "to_state": next_state,
+                        "failure_rate_2m": updated.failure_rate_2m,
+                        "timeout_rate_5m": updated.timeout_rate_5m
+                    }),
+                )
+                .await;
+        }
 
         self.circuit_store.save_snapshot(&updated).await?;
         Ok(())

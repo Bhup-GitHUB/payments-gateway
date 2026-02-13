@@ -17,8 +17,11 @@ use payments_gateway::repo::payments_repo::PaymentsRepo;
 use payments_gateway::repo::retry_policy_repo::RetryPolicyRepo;
 use payments_gateway::repo::routing_decisions_repo::RoutingDecisionsRepo;
 use payments_gateway::repo::scoring_config_repo::ScoringConfigRepo;
+use payments_gateway::repo::webhook_repo::WebhookRepo;
+use payments_gateway::service::config_cache::ConfigCache;
 use payments_gateway::service::outbox_relay::OutboxRelay;
 use payments_gateway::service::payment_service::PaymentService;
+use payments_gateway::service::webhook_dispatcher::WebhookDispatcher;
 use payments_gateway::AppState;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
@@ -54,6 +57,12 @@ async fn main() -> anyhow::Result<()> {
     let payment_verification_repo = PaymentVerificationRepo { pool: pool.clone() };
     let experiments_repo = ExperimentsRepo { pool: pool.clone() };
     let bandit_repo = BanditRepo { pool: pool.clone() };
+    let webhook_repo = WebhookRepo { pool: pool.clone() };
+    let webhook_dispatcher = WebhookDispatcher {
+        webhook_repo: webhook_repo.clone(),
+        client: reqwest::Client::new(),
+    };
+    let config_cache = ConfigCache::new(scoring_config_repo.clone(), std::time::Duration::from_secs(300));
     let razorpay = Arc::new(RazorpayGateway {
         base_url: std::env::var("RAZORPAY_BASE_URL")
             .unwrap_or_else(|_| "https://api.razorpay.com".to_string()),
@@ -82,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         retry_policy_repo: retry_policy_repo.clone(),
         error_classification_repo: error_classification_repo.clone(),
         payment_verification_repo: payment_verification_repo.clone(),
+        webhook_dispatcher: webhook_dispatcher.clone(),
         razorpay,
     };
 
@@ -104,6 +114,8 @@ async fn main() -> anyhow::Result<()> {
         payment_verification_repo,
         bandit_repo: bandit_repo.clone(),
         redis_client: redis::Client::open(cfg.redis_url.clone())?,
+        webhook_dispatcher: webhook_dispatcher.clone(),
+        config_cache,
     };
 
     let admin_key = cfg.internal_api_key.clone();
@@ -183,7 +195,16 @@ async fn main() -> anyhow::Result<()> {
             get(payments_gateway::http::handlers::experiment_winner::get_experiment_winner),
         )
         .route("/bandit/state", get(payments_gateway::http::handlers::bandit::get_state))
+        .route("/ops/readiness", get(payments_gateway::http::handlers::ops::readiness))
+        .route("/ops/liveness", get(payments_gateway::http::handlers::ops::liveness))
         .merge(admin_routes)
+        .layer(from_fn_with_state(
+            payments_gateway::http::middleware::rate_limit::RateLimitState {
+                redis_client: redis::Client::open(cfg.redis_url.clone())?,
+                max_per_minute: 300,
+            },
+            payments_gateway::http::middleware::rate_limit::enforce,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
