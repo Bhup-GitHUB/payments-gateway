@@ -48,6 +48,7 @@ mod tests {
             currency: "INR".to_string(),
             payment_method: PaymentMethod::Card,
             merchant_id: "m1".to_string(),
+            customer_id: "c1".to_string(),
             instrument: PaymentInstrument::Card(CardDetails {
                 number: "4111111111111111".to_string(),
                 exp_month: 12,
@@ -67,6 +68,7 @@ mod tests {
             currency: "INR".to_string(),
             payment_method: PaymentMethod::Upi,
             merchant_id: "m1".to_string(),
+            customer_id: "c1".to_string(),
             instrument: PaymentInstrument::Upi(UpiDetails {
                 vpa: "user@okhdfcbank".to_string(),
             }),

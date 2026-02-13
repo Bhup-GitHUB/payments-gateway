@@ -7,19 +7,24 @@ use crate::domain::payment::PaymentInstrument;
 use crate::domain::payment::{CreatePaymentRequest, CreatePaymentResponse, ErrorEnvelope, ErrorPayload, PaymentStatus};
 use crate::gateways::mock::MockGateway;
 use crate::gateways::razorpay::RazorpayGateway;
-use crate::gateways::{GatewayRequest, PaymentGateway};
+use crate::gateways::{GatewayConfig, GatewayRequest, GatewayResult, NormalizedGatewayResponse, PaymentGateway};
 use crate::metrics::amount_bucket::from_amount_minor;
 use crate::metrics::event::PaymentEvent;
 use crate::metrics::store_redis::MetricsHotStore;
 use crate::repo::circuit_breaker_config_repo::CircuitBreakerConfigRepo;
+use crate::repo::error_classification_repo::ErrorClassificationRepo;
 use crate::repo::gateways_repo::GatewaysRepo;
 use crate::repo::outbox_repo::OutboxRepo;
+use crate::repo::payment_attempts_repo::{NewPaymentAttempt, PaymentAttemptsRepo};
+use crate::repo::payment_verification_repo::PaymentVerificationRepo;
 use crate::repo::payments_repo::{PaymentRecordInput, PaymentsRepo};
+use crate::repo::retry_policy_repo::RetryPolicyRepo;
 use crate::repo::routing_decisions_repo::RoutingDecisionsRepo;
 use crate::repo::scoring_config_repo::ScoringConfigRepo;
 use crate::scoring::engine::rank_gateways;
 use crate::scoring::metrics_reader::read_metric_for_gateway;
 use crate::scoring::types::{GatewayCandidate, RankedGateway, ScoreInputs, ScoreWeights};
+use crate::service::retry_orchestrator::{attempt_limit, classify_attempt_result, should_stop_for_budget, RetryDirective};
 use axum::http::HeaderMap;
 use sqlx::PgPool;
 use std::collections::hash_map::DefaultHasher;
@@ -39,6 +44,10 @@ pub struct PaymentService {
     pub circuit_breaker_config_repo: CircuitBreakerConfigRepo,
     pub metrics_hot_store: MetricsHotStore,
     pub circuit_store: CircuitStoreRedis,
+    pub payment_attempts_repo: PaymentAttemptsRepo,
+    pub retry_policy_repo: RetryPolicyRepo,
+    pub error_classification_repo: ErrorClassificationRepo,
+    pub payment_verification_repo: PaymentVerificationRepo,
     pub razorpay: Arc<RazorpayGateway>,
 }
 
@@ -173,57 +182,174 @@ impl PaymentService {
             ));
         }
 
-        let (selected, selected_was_probe) = self
-            .pick_circuit_eligible(&ranked, &method)
+        let policy = self
+            .retry_policy_repo
+            .get_for_merchant(&req.merchant_id)
             .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    err("NO_GATEWAY_AVAILABLE", "all candidate gateways are circuit-open"),
-                )
-            })?;
+            .map_err(internal)?;
 
-        let selected_gateway = candidates
-            .iter()
-            .find(|c| c.gateway.gateway_id == selected.gateway_id)
-            .map(|c| c.gateway.clone())
-            .ok_or_else(|| {
-                (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    err("ROUTER_SELECTION_FAILED", "missing selected candidate"),
-                )
-            })?;
-
-        let gateway_request = GatewayRequest {
-            amount_minor: req.amount_minor,
-            currency: req.currency.clone(),
-            merchant_id: req.merchant_id.clone(),
-        };
-
-        let start = Instant::now();
-        let gateway_result = if selected_gateway.adapter_type == "RAZORPAY" {
-            self.razorpay
-                .initiate_payment(&context, gateway_request)
-                .await
-                .map_err(internal)?
-        } else {
-            let mock = MockGateway {
-                gateway_name: selected_gateway.gateway_id.clone(),
-                behavior: selected_gateway
-                    .mock_behavior
-                    .clone()
-                    .unwrap_or_else(|| "ALWAYS_SUCCESS".to_string()),
-            };
-            mock.initiate_payment(&context, gateway_request)
-                .await
-                .map_err(internal)?
-        };
-
-        let latency_ms = start.elapsed().as_millis() as i32;
         let payment_id = Uuid::new_v4();
+        let retry_started = Instant::now();
+
+        let mut final_result: Option<(RankedGateway, GatewayResult, i32, String)> = None;
+        let mut pending_verification_gateway: Option<String> = None;
+
+        let max_attempts = attempt_limit(&policy) as usize;
+        for (idx, ranked_gateway) in ranked.iter().take(max_attempts).enumerate() {
+            if should_stop_for_budget(retry_started, &policy) {
+                break;
+            }
+
+            let attempt_number = (idx + 1) as i32;
+            let Some(selected_gateway) = find_gateway_config(&candidates, &ranked_gateway.gateway_id) else {
+                continue;
+            };
+
+            let (circuit_allowed, was_probe, circuit_state, circuit_reason) = self
+                .check_circuit(&ranked_gateway.gateway_id, &method)
+                .await
+                .map_err(internal)?;
+
+            if !circuit_allowed {
+                self.payment_attempts_repo
+                    .insert(NewPaymentAttempt {
+                        payment_id,
+                        attempt_number,
+                        gateway_used: ranked_gateway.gateway_id.clone(),
+                        status: "SKIPPED".to_string(),
+                        error_code: None,
+                        latency_ms: 0,
+                        circuit_breaker_state: Some(circuit_state),
+                        fallback_reason: Some(circuit_reason),
+                        transaction_ref: None,
+                    })
+                    .await
+                    .map_err(internal)?;
+                continue;
+            }
+
+            let gateway_request = GatewayRequest {
+                amount_minor: req.amount_minor,
+                currency: req.currency.clone(),
+                merchant_id: req.merchant_id.clone(),
+            };
+
+            let (gateway_result, latency_ms) = self
+                .execute_gateway_call(&selected_gateway, &context, gateway_request)
+                .await
+                .map_err(internal)?;
+
+            self.payment_attempts_repo
+                .insert(NewPaymentAttempt {
+                    payment_id,
+                    attempt_number,
+                    gateway_used: gateway_result.gateway_used.clone(),
+                    status: format!("{:?}", gateway_result.response.status).to_uppercase(),
+                    error_code: gateway_result.response.error_code.clone(),
+                    latency_ms,
+                    circuit_breaker_state: Some(circuit_state.clone()),
+                    fallback_reason: if attempt_number == 1 {
+                        None
+                    } else {
+                        Some("fallback_retry".to_string())
+                    },
+                    transaction_ref: gateway_result.response.transaction_id.clone(),
+                })
+                .await
+                .map_err(internal)?;
+
+            self.update_circuit_state(
+                &ranked_gateway.gateway_id,
+                &method,
+                &format!("{:?}", gateway_result.response.status).to_uppercase(),
+                was_probe,
+            )
+            .await
+            .map_err(internal)?;
+
+            let error_class = if let Some(code) = &gateway_result.response.error_code {
+                Some(
+                    self.error_classification_repo
+                        .classify(&ranked_gateway.gateway_id, code)
+                        .await
+                        .map_err(internal)?,
+                )
+            } else {
+                None
+            };
+
+            match classify_attempt_result(
+                &gateway_result.response.status,
+                error_class.as_ref(),
+                policy.retry_on_timeout,
+            ) {
+                RetryDirective::Success => {
+                    final_result = Some((
+                        ranked_gateway.clone(),
+                        gateway_result,
+                        latency_ms,
+                        if attempt_number == 1 {
+                            "primary_success".to_string()
+                        } else {
+                            format!("fallback_success_attempt_{}", attempt_number)
+                        },
+                    ));
+                    break;
+                }
+                RetryDirective::PendingVerification => {
+                    pending_verification_gateway = Some(ranked_gateway.gateway_id.clone());
+                    final_result = Some((
+                        ranked_gateway.clone(),
+                        GatewayResult {
+                            gateway_used: ranked_gateway.gateway_id.clone(),
+                            response: NormalizedGatewayResponse {
+                                status: PaymentStatus::PendingVerification,
+                                transaction_id: gateway_result.response.transaction_id.clone(),
+                                auth_code: None,
+                                error_code: gateway_result.response.error_code.clone(),
+                                error_message: gateway_result.response.error_message.clone(),
+                                gateway_response_code: gateway_result.response.gateway_response_code.clone(),
+                            },
+                        },
+                        latency_ms,
+                        "timeout_pending_verification".to_string(),
+                    ));
+                    break;
+                }
+                RetryDirective::Continue => continue,
+                RetryDirective::FailNow => {
+                    final_result = Some((
+                        ranked_gateway.clone(),
+                        gateway_result,
+                        latency_ms,
+                        "non_retryable_failure".to_string(),
+                    ));
+                    break;
+                }
+            }
+        }
+
+        let Some((selected, gateway_result, latency_ms, outcome_reason)) = final_result else {
+            return Err((
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                err("RETRY_EXHAUSTED", "no gateway could complete payment within retry budget"),
+            ));
+        };
+
+        if let Some(gateway_id) = &pending_verification_gateway {
+            self.payment_verification_repo
+                .enqueue_timeout(
+                    payment_id,
+                    gateway_id,
+                    chrono::Utc::now() + chrono::Duration::minutes(2),
+                )
+                .await
+                .map_err(internal)?;
+        }
+
         let routing_reason = format!(
-            "top_score={:.4}, runner_up={}",
+            "reason={}, top_score={:.4}, runner_up={}",
+            outcome_reason,
             selected.score,
             ranked
                 .get(1)
@@ -239,13 +365,13 @@ impl PaymentService {
             req: req.clone(),
             issuing_bank: Some(issuing_bank.clone()),
             gateway_used: gateway_result.gateway_used.clone(),
-            routing_strategy: "SCORING_ENGINE".to_string(),
+            routing_strategy: "SCORING_ENGINE_FALLBACK".to_string(),
             routing_reason: routing_reason.clone(),
             status: gateway_result.response.status.clone(),
             gateway_transaction_ref: gateway_result.response.transaction_id.clone(),
             gateway_response_code: gateway_result.response.gateway_response_code.clone(),
             error_message: gateway_result.response.error_message.clone(),
-            latency_ms,
+            latency_ms: retry_started.elapsed().as_millis() as i32,
         };
 
         let event = PaymentEvent {
@@ -281,7 +407,7 @@ impl PaymentService {
                 selected.score,
                 ranked.get(1).map(|r| r.gateway_id.as_str()),
                 ranked.get(1).map(|r| r.score),
-                "SCORING_ENGINE",
+                "SCORING_ENGINE_FALLBACK",
                 &routing_reason,
                 serde_json::to_value(&selected.breakdown).map_err(|e| internal(e.into()))?,
                 serde_json::to_value(&ranked).map_err(|e| internal(e.into()))?,
@@ -289,61 +415,97 @@ impl PaymentService {
             .await
             .map_err(internal)?;
 
-        self.update_circuit_state(
-            &selected.gateway_id,
-            &method,
-            &format!("{:?}", gateway_result.response.status).to_uppercase(),
-            selected_was_probe,
-        )
-        .await
-        .map_err(internal)?;
-
         Ok(CreatePaymentResponse {
             payment_id,
             status: gateway_result.response.status,
             gateway_used: gateway_result.gateway_used,
             transaction_ref: gateway_result.response.transaction_id,
-            routing_strategy: "SCORING_ENGINE".to_string(),
+            routing_strategy: "SCORING_ENGINE_FALLBACK".to_string(),
             routing_reason,
-            latency_ms,
+            latency_ms: retry_started.elapsed().as_millis() as i32,
         })
     }
 
-    async fn pick_circuit_eligible(
+    async fn check_circuit(
         &self,
-        ranked: &[RankedGateway],
+        gateway_id: &str,
         method: &str,
-    ) -> anyhow::Result<Option<(RankedGateway, bool)>> {
-        for candidate in ranked {
-            let override_state = self
-                .circuit_store
-                .get_override(&candidate.gateway_id, method)
-                .await?;
-
-            if override_state.as_deref() == Some("FORCE_OPEN") {
-                continue;
-            }
-            if override_state.as_deref() == Some("FORCE_CLOSED") {
-                return Ok(Some((candidate.clone(), false)));
-            }
-
-            let thresholds = self
-                .circuit_breaker_config_repo
-                .get_thresholds(&candidate.gateway_id, method)
-                .await?;
-            let snapshot = self
-                .circuit_store
-                .get_snapshot(&candidate.gateway_id, method)
-                .await?;
-
-            match pre_call_decision(&snapshot, &thresholds, chrono::Utc::now()) {
-                CircuitDecision::Allow => return Ok(Some((candidate.clone(), false))),
-                CircuitDecision::Probe => return Ok(Some((candidate.clone(), true))),
-                CircuitDecision::Reject(_) => {}
-            }
+    ) -> anyhow::Result<(bool, bool, String, String)> {
+        let override_state = self.circuit_store.get_override(gateway_id, method).await?;
+        if override_state.as_deref() == Some("FORCE_OPEN") {
+            return Ok((false, false, "OPEN".to_string(), "manual_force_open".to_string()));
+        }
+        if override_state.as_deref() == Some("FORCE_CLOSED") {
+            return Ok((true, false, "CLOSED".to_string(), "manual_force_closed".to_string()));
         }
 
-        Ok(None)
+        let thresholds = self
+            .circuit_breaker_config_repo
+            .get_thresholds(gateway_id, method)
+            .await?;
+        let snapshot = self.circuit_store.get_snapshot(gateway_id, method).await?;
+
+        match pre_call_decision(&snapshot, &thresholds, chrono::Utc::now()) {
+            CircuitDecision::Allow => Ok((true, false, format!("{:?}", snapshot.state).to_uppercase(), "allow".to_string())),
+            CircuitDecision::Probe => Ok((true, true, "HALF_OPEN".to_string(), "probe".to_string())),
+            CircuitDecision::Reject(reason) => Ok((false, false, format!("{:?}", snapshot.state).to_uppercase(), reason)),
+        }
+    }
+
+    async fn execute_gateway_call(
+        &self,
+        gateway: &GatewayConfig,
+        context: &crate::domain::context::PaymentContext,
+        gateway_request: GatewayRequest,
+    ) -> anyhow::Result<(GatewayResult, i32)> {
+        let timeout_ms = gateway.timeout_ms.max(100) as u64;
+        let started = Instant::now();
+
+        let call_future = async {
+            if gateway.adapter_type == "RAZORPAY" {
+                self.razorpay.initiate_payment(context, gateway_request).await
+            } else {
+                let mock = MockGateway {
+                    gateway_name: gateway.gateway_id.clone(),
+                    behavior: gateway
+                        .mock_behavior
+                        .clone()
+                        .unwrap_or_else(|| "ALWAYS_SUCCESS".to_string()),
+                };
+                mock.initiate_payment(context, gateway_request).await
+            }
+        };
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), call_future).await;
+        let latency = started.elapsed().as_millis() as i32;
+
+        let gateway_result = match result {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => GatewayResult {
+                gateway_used: gateway.gateway_id.clone(),
+                response: NormalizedGatewayResponse {
+                    status: PaymentStatus::Failure,
+                    transaction_id: None,
+                    auth_code: None,
+                    error_code: Some("NETWORK_ERROR".to_string()),
+                    error_message: Some(e.to_string()),
+                    gateway_response_code: None,
+                },
+            },
+            Err(_) => GatewayResult {
+                gateway_used: gateway.gateway_id.clone(),
+                response: NormalizedGatewayResponse {
+                    status: PaymentStatus::Timeout,
+                    transaction_id: None,
+                    auth_code: None,
+                    error_code: Some("GATEWAY_TIMEOUT".to_string()),
+                    error_message: Some("gateway timed out".to_string()),
+                    gateway_response_code: Some("504".to_string()),
+                },
+            },
+        };
+
+        Ok((gateway_result, latency))
     }
 
     async fn update_circuit_state(
@@ -392,7 +554,11 @@ impl PaymentService {
         context: &crate::domain::context::PaymentContext,
     ) -> anyhow::Result<String> {
         if let PaymentInstrument::Card(card) = &req.instrument {
-            if let Some(bank) = self.scoring_config_repo.resolve_bank_from_bin(&card.number).await? {
+            if let Some(bank) = self
+                .scoring_config_repo
+                .resolve_bank_from_bin(&card.number)
+                .await?
+            {
                 return Ok(bank.to_uppercase());
             }
         }
@@ -403,6 +569,13 @@ impl PaymentService {
             .unwrap_or_else(|| "UNKNOWN".to_string())
             .to_uppercase())
     }
+}
+
+fn find_gateway_config(candidates: &[GatewayCandidate], gateway_id: &str) -> Option<GatewayConfig> {
+    candidates
+        .iter()
+        .find(|c| c.gateway.gateway_id == gateway_id)
+        .map(|c| c.gateway.clone())
 }
 
 fn to_weights(w: &crate::repo::scoring_config_repo::ScoringWeights) -> ScoreWeights {
@@ -426,7 +599,13 @@ fn validate_request(req: &CreatePaymentRequest) -> Result<(), (axum::http::Statu
     if req.currency != "INR" {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
-            err("INVALID_CURRENCY", "only INR supported in phase 1/2"),
+            err("INVALID_CURRENCY", "only INR supported"),
+        ));
+    }
+    if req.customer_id.trim().is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            err("INVALID_CUSTOMER_ID", "customer_id is required"),
         ));
     }
     Ok(())
@@ -443,6 +622,7 @@ fn parse_status(s: &str) -> PaymentStatus {
     match s {
         "SUCCESS" => PaymentStatus::Success,
         "TIMEOUT" => PaymentStatus::Timeout,
+        "PENDING_VERIFICATION" => PaymentStatus::PendingVerification,
         _ => PaymentStatus::Failure,
     }
 }

@@ -109,6 +109,13 @@ impl SlidingMetrics {
                     *bucket.error_counts.entry(code.clone()).or_insert(0) += 1;
                 }
             }
+            PaymentStatus::PendingVerification => {
+                bucket.failed += 1;
+                bucket.timeout += 1;
+                if let Some(code) = &event.error_code {
+                    *bucket.error_counts.entry(code.clone()).or_insert(0) += 1;
+                }
+            }
         }
 
         let floor = minute - (59 * 60);

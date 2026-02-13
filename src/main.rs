@@ -5,9 +5,13 @@ use payments_gateway::circuit::store_redis::CircuitStoreRedis;
 use payments_gateway::gateways::razorpay::RazorpayGateway;
 use payments_gateway::metrics::store_redis::MetricsHotStore;
 use payments_gateway::repo::circuit_breaker_config_repo::CircuitBreakerConfigRepo;
+use payments_gateway::repo::error_classification_repo::ErrorClassificationRepo;
 use payments_gateway::repo::gateways_repo::GatewaysRepo;
 use payments_gateway::repo::outbox_repo::OutboxRepo;
+use payments_gateway::repo::payment_attempts_repo::PaymentAttemptsRepo;
+use payments_gateway::repo::payment_verification_repo::PaymentVerificationRepo;
 use payments_gateway::repo::payments_repo::PaymentsRepo;
+use payments_gateway::repo::retry_policy_repo::RetryPolicyRepo;
 use payments_gateway::repo::routing_decisions_repo::RoutingDecisionsRepo;
 use payments_gateway::repo::scoring_config_repo::ScoringConfigRepo;
 use payments_gateway::service::outbox_relay::OutboxRelay;
@@ -41,6 +45,10 @@ async fn main() -> anyhow::Result<()> {
     let scoring_config_repo = ScoringConfigRepo { pool: pool.clone() };
     let routing_decisions_repo = RoutingDecisionsRepo { pool: pool.clone() };
     let circuit_breaker_config_repo = CircuitBreakerConfigRepo { pool: pool.clone() };
+    let payment_attempts_repo = PaymentAttemptsRepo { pool: pool.clone() };
+    let retry_policy_repo = RetryPolicyRepo { pool: pool.clone() };
+    let error_classification_repo = ErrorClassificationRepo { pool: pool.clone() };
+    let payment_verification_repo = PaymentVerificationRepo { pool: pool.clone() };
     let razorpay = Arc::new(RazorpayGateway {
         base_url: std::env::var("RAZORPAY_BASE_URL")
             .unwrap_or_else(|_| "https://api.razorpay.com".to_string()),
@@ -63,6 +71,10 @@ async fn main() -> anyhow::Result<()> {
         circuit_breaker_config_repo: circuit_breaker_config_repo.clone(),
         metrics_hot_store: metrics_hot_store.clone(),
         circuit_store: CircuitStoreRedis::new(redis::Client::open(cfg.redis_url.clone())?),
+        payment_attempts_repo: payment_attempts_repo.clone(),
+        retry_policy_repo: retry_policy_repo.clone(),
+        error_classification_repo: error_classification_repo.clone(),
+        payment_verification_repo: payment_verification_repo.clone(),
         razorpay,
     };
 
@@ -79,6 +91,9 @@ async fn main() -> anyhow::Result<()> {
         metrics_hot_store,
         routing_decisions_repo,
         circuit_breaker_config_repo,
+        payment_attempts_repo,
+        retry_policy_repo,
+        payment_verification_repo,
         redis_client: redis::Client::open(cfg.redis_url.clone())?,
     };
 
