@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
         payments_repo,
         outbox_repo: outbox_repo.clone(),
         gateways_repo: gateways_repo.clone(),
+        experiments_repo: experiments_repo.clone(),
         scoring_config_repo,
         routing_decisions_repo: routing_decisions_repo.clone(),
         circuit_breaker_config_repo: circuit_breaker_config_repo.clone(),

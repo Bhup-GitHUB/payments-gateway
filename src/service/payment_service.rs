@@ -3,6 +3,8 @@ use crate::circuit::state::CircuitDecision;
 use crate::circuit::store_redis::CircuitStoreRedis;
 use crate::circuit::transitions::apply_transition;
 use crate::domain::context::build_context;
+use crate::experiments::assigner::assign_variant;
+use crate::experiments::filter::{matches as experiment_matches, MatchInput as ExperimentMatchInput};
 use crate::domain::payment::PaymentInstrument;
 use crate::domain::payment::{CreatePaymentRequest, CreatePaymentResponse, ErrorEnvelope, ErrorPayload, PaymentStatus};
 use crate::gateways::mock::MockGateway;
@@ -13,6 +15,7 @@ use crate::metrics::event::PaymentEvent;
 use crate::metrics::store_redis::MetricsHotStore;
 use crate::repo::circuit_breaker_config_repo::CircuitBreakerConfigRepo;
 use crate::repo::error_classification_repo::ErrorClassificationRepo;
+use crate::repo::experiments_repo::ExperimentsRepo;
 use crate::repo::gateways_repo::GatewaysRepo;
 use crate::repo::outbox_repo::OutboxRepo;
 use crate::repo::payment_attempts_repo::{NewPaymentAttempt, PaymentAttemptsRepo};
@@ -26,6 +29,7 @@ use crate::scoring::metrics_reader::read_metric_for_gateway;
 use crate::scoring::types::{GatewayCandidate, RankedGateway, ScoreInputs, ScoreWeights};
 use crate::service::retry_orchestrator::{attempt_limit, classify_attempt_result, should_stop_for_budget, RetryDirective};
 use axum::http::HeaderMap;
+use chrono::Timelike;
 use sqlx::PgPool;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -39,6 +43,7 @@ pub struct PaymentService {
     pub payments_repo: PaymentsRepo,
     pub outbox_repo: OutboxRepo,
     pub gateways_repo: GatewaysRepo,
+    pub experiments_repo: ExperimentsRepo,
     pub scoring_config_repo: ScoringConfigRepo,
     pub routing_decisions_repo: RoutingDecisionsRepo,
     pub circuit_breaker_config_repo: CircuitBreakerConfigRepo,
@@ -125,6 +130,10 @@ impl PaymentService {
         let issuing_bank = self.resolve_issuing_bank(&req, &context).await.map_err(internal)?;
         let amount_bucket = from_amount_minor(req.amount_minor);
         let weights = self.scoring_config_repo.load_weights().await.map_err(internal)?;
+        let experiment_ctx = self
+            .resolve_experiment(&req, &method, &amount_bucket)
+            .await
+            .map_err(internal)?;
 
         let mut candidates = Vec::new();
         for gateway in available {
@@ -175,6 +184,7 @@ impl PaymentService {
         }
 
         let ranked = rank_gateways(&candidates, &to_weights(&weights));
+        let ranked = apply_experiment_override(ranked, experiment_ctx.as_ref().and_then(|c| c.forced_gateway.clone()));
         if ranked.is_empty() {
             return Err((
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -348,12 +358,16 @@ impl PaymentService {
         }
 
         let routing_reason = format!(
-            "reason={}, top_score={:.4}, runner_up={}",
+            "reason={}, top_score={:.4}, runner_up={}, experiment={}",
             outcome_reason,
             selected.score,
             ranked
                 .get(1)
                 .map(|r| r.gateway_id.clone())
+                .unwrap_or_else(|| "none".to_string()),
+            experiment_ctx
+                .as_ref()
+                .map(|e| format!("{}:{}", e.experiment_id, e.variant))
                 .unwrap_or_else(|| "none".to_string())
         );
 
@@ -414,6 +428,20 @@ impl PaymentService {
             )
             .await
             .map_err(internal)?;
+
+        if let Some(exp) = &experiment_ctx {
+            self.experiments_repo
+                .record_result(
+                    exp.experiment_id,
+                    &exp.variant,
+                    hour_floor(chrono::Utc::now()),
+                    matches!(gateway_result.response.status, PaymentStatus::Success),
+                    latency_ms,
+                    req.amount_minor,
+                )
+                .await
+                .map_err(internal)?;
+        }
 
         Ok(CreatePaymentResponse {
             payment_id,
@@ -569,6 +597,68 @@ impl PaymentService {
             .unwrap_or_else(|| "UNKNOWN".to_string())
             .to_uppercase())
     }
+
+    async fn resolve_experiment(
+        &self,
+        req: &CreatePaymentRequest,
+        method: &str,
+        amount_bucket: &str,
+    ) -> anyhow::Result<Option<ResolvedExperiment>> {
+        let active = self.experiments_repo.get_active_with_filters().await?;
+        let input = ExperimentMatchInput {
+            payment_method: method.to_string(),
+            amount_minor: req.amount_minor,
+            merchant_id: req.merchant_id.clone(),
+            amount_bucket: amount_bucket.to_string(),
+        };
+
+        for (exp, filter) in active {
+            if !experiment_matches(&filter, &input) {
+                continue;
+            }
+
+            let assignment = assign_variant(&req.customer_id, exp.experiment_id, exp.traffic_control_pct);
+            self.experiments_repo
+                .upsert_assignment(exp.experiment_id, &req.customer_id, &assignment.variant, assignment.bucket)
+                .await?;
+
+            let forced_gateway = if assignment.variant == "treatment" {
+                Some(exp.treatment_gateway.clone())
+            } else {
+                None
+            };
+
+            return Ok(Some(ResolvedExperiment {
+                experiment_id: exp.experiment_id,
+                variant: assignment.variant,
+                forced_gateway,
+            }));
+        }
+
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedExperiment {
+    experiment_id: uuid::Uuid,
+    variant: String,
+    forced_gateway: Option<String>,
+}
+
+fn apply_experiment_override(mut ranked: Vec<RankedGateway>, forced_gateway: Option<String>) -> Vec<RankedGateway> {
+    if let Some(forced_gateway) = forced_gateway {
+        if let Some(index) = ranked.iter().position(|r| r.gateway_id == forced_gateway) {
+            let forced = ranked.remove(index);
+            ranked.insert(0, forced);
+        }
+    }
+    ranked
+}
+
+fn hour_floor(ts: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    let secs = ts.timestamp() - (ts.minute() as i64 * 60) - ts.second() as i64;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap_or(ts)
 }
 
 fn find_gateway_config(candidates: &[GatewayCandidate], gateway_id: &str) -> Option<GatewayConfig> {
