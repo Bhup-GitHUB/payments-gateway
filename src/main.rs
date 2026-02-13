@@ -170,6 +170,10 @@ async fn main() -> anyhow::Result<()> {
             "/experiments/:id/results",
             get(payments_gateway::http::handlers::experiments::get_results),
         )
+        .route(
+            "/experiments/:id/winner",
+            get(payments_gateway::http::handlers::experiment_winner::get_experiment_winner),
+        )
         .merge(admin_routes)
         .with_state(state);
 

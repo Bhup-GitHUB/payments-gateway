@@ -12,6 +12,7 @@ pub mod http {
     }
     pub mod handlers {
         pub mod circuit_breaker;
+        pub mod experiment_winner;
         pub mod experiments;
         pub mod gateways;
         pub mod metrics;
