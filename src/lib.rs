@@ -2,6 +2,7 @@ pub mod config;
 pub mod domain {
     pub mod context;
     pub mod payment;
+    pub mod routing_decision;
 }
 pub mod gateways;
 pub mod http {
