@@ -42,6 +42,7 @@ pub struct CreatePaymentRequest {
     pub currency: String,
     pub payment_method: PaymentMethod,
     pub merchant_id: String,
+    pub customer_id: String,
     pub instrument: PaymentInstrument,
 }
 
@@ -51,6 +52,7 @@ pub enum PaymentStatus {
     Success,
     Failure,
     Timeout,
+    PendingVerification,
 }
 
 #[derive(Debug, Clone, Serialize)]

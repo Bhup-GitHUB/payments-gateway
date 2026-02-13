@@ -36,6 +36,7 @@ pub mod circuit;
 pub mod service {
     pub mod outbox_relay;
     pub mod payment_service;
+    pub mod retry_orchestrator;
 }
 
 #[derive(Clone)]
