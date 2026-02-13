@@ -22,6 +22,7 @@ pub mod repo {
     pub mod gateways_repo;
     pub mod outbox_repo;
     pub mod payment_attempts_repo;
+    pub mod payment_verification_repo;
     pub mod payments_repo;
     pub mod routing_decisions_repo;
     pub mod retry_policy_repo;
