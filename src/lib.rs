@@ -36,4 +36,7 @@ pub struct AppState {
     pub payment_service: service::payment_service::PaymentService,
     pub gateways_repo: repo::gateways_repo::GatewaysRepo,
     pub metrics_hot_store: metrics::store_redis::MetricsHotStore,
+    pub routing_decisions_repo: repo::routing_decisions_repo::RoutingDecisionsRepo,
+    pub circuit_breaker_config_repo: repo::circuit_breaker_config_repo::CircuitBreakerConfigRepo,
+    pub redis_client: redis::Client,
 }

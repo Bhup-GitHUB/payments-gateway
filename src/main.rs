@@ -3,15 +3,16 @@ use axum::Router;
 use payments_gateway::config::AppConfig;
 use payments_gateway::gateways::razorpay::RazorpayGateway;
 use payments_gateway::metrics::store_redis::MetricsHotStore;
+use payments_gateway::repo::circuit_breaker_config_repo::CircuitBreakerConfigRepo;
 use payments_gateway::repo::gateways_repo::GatewaysRepo;
 use payments_gateway::repo::outbox_repo::OutboxRepo;
 use payments_gateway::repo::payments_repo::PaymentsRepo;
-use payments_gateway::router::round_robin::RoundRobinRouter;
+use payments_gateway::repo::routing_decisions_repo::RoutingDecisionsRepo;
+use payments_gateway::repo::scoring_config_repo::ScoringConfigRepo;
 use payments_gateway::service::outbox_relay::OutboxRelay;
 use payments_gateway::service::payment_service::PaymentService;
 use payments_gateway::AppState;
 use sqlx::postgres::PgPoolOptions;
-use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -35,8 +36,9 @@ async fn main() -> anyhow::Result<()> {
     let gateways_repo = GatewaysRepo { pool: pool.clone() };
     let payments_repo = PaymentsRepo { pool: pool.clone() };
     let outbox_repo = OutboxRepo { pool: pool.clone() };
-
-    let router = Arc::new(RoundRobinRouter::new());
+    let scoring_config_repo = ScoringConfigRepo { pool: pool.clone() };
+    let routing_decisions_repo = RoutingDecisionsRepo { pool: pool.clone() };
+    let circuit_breaker_config_repo = CircuitBreakerConfigRepo { pool: pool.clone() };
     let razorpay = Arc::new(RazorpayGateway {
         base_url: std::env::var("RAZORPAY_BASE_URL")
             .unwrap_or_else(|_| "https://api.razorpay.com".to_string()),
@@ -54,7 +56,9 @@ async fn main() -> anyhow::Result<()> {
         payments_repo,
         outbox_repo: outbox_repo.clone(),
         gateways_repo: gateways_repo.clone(),
-        router,
+        scoring_config_repo,
+        routing_decisions_repo: routing_decisions_repo.clone(),
+        metrics_hot_store: metrics_hot_store.clone(),
         razorpay,
     };
 
@@ -69,6 +73,9 @@ async fn main() -> anyhow::Result<()> {
         payment_service,
         gateways_repo,
         metrics_hot_store,
+        routing_decisions_repo,
+        circuit_breaker_config_repo,
+        redis_client: redis::Client::open(cfg.redis_url.clone())?,
     };
 
     let app = Router::new()
