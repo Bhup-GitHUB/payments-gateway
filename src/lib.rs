@@ -7,9 +7,12 @@ pub mod domain {
 pub mod gateways;
 pub mod http {
     pub mod handlers {
+        pub mod circuit_breaker;
         pub mod gateways;
         pub mod metrics;
         pub mod payments;
+        pub mod routing_decisions;
+        pub mod scoring_debug;
     }
 }
 pub mod metrics;

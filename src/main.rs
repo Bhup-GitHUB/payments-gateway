@@ -81,6 +81,10 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(payments_gateway::http::handlers::payments::health))
         .route("/payments", post(payments_gateway::http::handlers::payments::create_payment))
+        .route(
+            "/payments/:payment_id/routing-decision",
+            get(payments_gateway::http::handlers::routing_decisions::get_routing_decision),
+        )
         .route("/gateways", get(payments_gateway::http::handlers::gateways::list_gateways))
         .route(
             "/gateways/:gateway_id",
@@ -89,6 +93,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/metrics/gateways/:gateway_name",
             get(payments_gateway::http::handlers::metrics::get_gateway_metrics),
+        )
+        .route(
+            "/scoring/debug",
+            get(payments_gateway::http::handlers::scoring_debug::scoring_debug),
         )
         .with_state(state);
 
